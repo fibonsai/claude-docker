@@ -59,7 +59,7 @@ Claude Code authenticates directly to Anthropic with `ANTHROPIC_API_KEY`.
 The secure, multi-provider architecture routes every sandboxed agent through **OmniRoute**, which holds the real upstream provider keys (`NVIDIA_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, etc.) in its own system environment. The sandbox agent sees **only** an OmniRoute API key (`OMNIROUTE_API_KEY`) and can reach **only** OmniRoute's OpenAI-compatible endpoint — never the upstream providers directly.
 
 ```
-OpenCode / Claude Code / curl (sandbox)
+Claude Code / curl (sandbox)
         │  OMNIROUTE_API_KEY (opaque placeholder)
         ▼
 OmniRoute :20128/v1   (OpenAI-compatible gateway)
@@ -136,7 +136,7 @@ endpoints:
     enforcement: enforce
 
 binaries:
-  - /usr/local/bin/opencode
+  - /home/claude/.local/bin/claude
   - /usr/local/bin/node
   - /usr/bin/curl
   - /usr/local/bin/curl
@@ -147,7 +147,7 @@ The profile enforces strict credential-to-endpoint binding:
 - **Sandbox sees only `OMNIROUTE_API_KEY`.** Upstream `{PROVIDER}_API_KEY` values never enter the sandbox.
 - **`path: /v1/**`** limits the sandbox to OmniRoute's OpenAI-compatible API; the dashboard and every other host are unreachable.
 - **`enforcement: enforce`** blocks any request outside the allowed endpoint.
-- **`binaries` allowlist** restricts which processes may use the endpoint.
+- **`binaries` allowlist** restricts which processes may use the endpoint to `claude` (at `/home/claude/.local/bin/claude`), `node`, and `curl`.
 
 Lint, import, and create the provider:
 
@@ -159,69 +159,9 @@ openshell provider create --name omniroute --type omniroute --from-existing
 
 `--from-existing` reads `OMNIROUTE_API_KEY` from your shell and stores it in OpenShell; the sandbox receives only an opaque placeholder.
 
-### Step 3 — Run OpenCode through OmniRoute
+### Step 3 — Run Claude Code through OmniRoute
 
-Save this OpenCode config as `opencode.json`:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "providers": {
-    "omniroute": {
-      "name": "OmniRoute",
-      "env": ["OMNIROUTE_API_KEY"],
-      "package": "@opencode/ai/providers/openai-compatible",
-      "settings": {
-        "baseURL": "http://host.openshell.internal:20128/v1"
-      },
-      "models": {
-        "auto": { "name": "OmniRoute auto" }
-      }
-    }
-  }
-}
-```
-
-Create a detached sandbox from the OpenCode image, upload the config, and start the agent:
-
-```bash
-openshell sandbox create \
-  --name omniroute-agent \
-  --from ghcr.io/anomalyco/opencode:latest \
-  --provider omniroute \
-  --upload ./opencode.json:/workspace/opencode.json \
-  --no-git-ignore \
-  --detach
-
-openshell sandbox exec -n omniroute-agent --workdir /workspace -- \
-  opencode run --model omniroute/auto "Summarize the files in this workspace."
-```
-
-OpenCode reads `OMNIROUTE_API_KEY` from the sandbox environment, sends it to `host.openshell.internal:20128/v1`, and OmniRoute chooses a provider for the `auto` model.
-
-If the detached login shell exits immediately, use a keepalive instead:
-
-```bash
-openshell sandbox create \
-  --name omniroute-agent \
-  --from ghcr.io/anomalyco/opencode:latest \
-  --provider omniroute \
-  --detach \
-  -- sh -c 'sleep 86400'
-
-openshell sandbox upload omniroute-agent ./opencode.json /workspace/opencode.json --no-git-ignore
-
-openshell sandbox exec -n omniroute-agent --workdir /workspace -- \
-  opencode run --model omniroute/auto "Summarize the files in this workspace."
-```
-
-For an interactive session in OpenCode 2.x, use `opencode mini --model omniroute/auto`.
-
-To pin a destination provider, use a model ID that OmniRoute exposes (e.g. `omniroute/nvidia/<model-id>`), listed by `opencode models` or the OmniRoute dashboard.
-
-### Step 4 — Run Claude Code through OmniRoute
-
-Claude Code can point at any OpenAI-compatible endpoint via `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`. Build your own image with the Claude Code CLI installed (this repo's Dockerfile) and reference it as `<your-claude-code-image>`. Run it inside an `omniroute` sandbox so it reaches OmniRoute — and therefore every connected provider — without holding any upstream `{PROVIDER}_API_KEY`:
+This project's Dockerfile installs the Claude Code CLI at `/home/claude/.local/bin/claude`. Build your own image from this repo and reference it as `<your-claude-code-image>`. Run it inside an `omniroute` sandbox so it reaches OmniRoute — and therefore every connected provider — without holding any upstream `{PROVIDER}_API_KEY`:
 
 ```bash
 openshell sandbox create \
@@ -235,12 +175,14 @@ openshell sandbox create \
   -- sh -c 'sleep 86400'
 
 openshell sandbox exec -n claude-code-agent --workdir /workspace -- \
-  claude "Summarize the files in this workspace."
+  /home/claude/.local/bin/claude "Summarize the files in this workspace."
 ```
 
 Claude Code authenticates to OmniRoute with `OMNIROUTE_API_KEY`, and OmniRoute routes to the configured provider (e.g. NVIDIA NIM, OpenAI, Gemini). The Claude Code sandbox never sees `NVIDIA_API_KEY`, `GEMINI_API_KEY`, or any other upstream key.
 
-### Step 5 — Run Hermes Gateway through OmniRoute
+Claude Code uses `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` to point at any OpenAI-compatible endpoint, so OmniRoute's `/v1/chat/completions` works as a drop-in replacement for the Anthropic API.
+
+### Step 4 — Run Hermes Gateway through OmniRoute
 
 Hermes Agent (NousResearch) runs inside an OpenShell sandbox via the OpenShell gateway (`hermesclaw`, from the `hermesclaw` project — there is no official NousResearch/NVIDIA Docker image; build your own image with `hermesclaw` installed). Point Hermes Gateway at OmniRoute's OpenAI-compatible endpoint so all model traffic is proxied through OmniRoute:
 
@@ -270,7 +212,7 @@ Use two dedicated OpenShell providers, one per sandbox:
 | Sandbox | Provider | Purpose |
 | --- | --- | --- |
 | OmniRoute sandbox | `omniroute-all-providers` | Runs `omniroute --daemon` inside the sandbox. Holds all `{PROVIDER}_API_KEY` values and proxies agent requests to the correct provider endpoint. |
-| Agent sandbox (OpenCode, Claude Code, curl) | `omniroute-agent` | Runs the agent. Holds only `OMNIROUTE_API_KEY`. Can reach **only** the OmniRoute gateway endpoint; no provider keys and no direct provider-endpoint access. |
+| Agent sandbox (Claude Code, curl) | `omniroute-agent` | Runs the agent. Holds only `OMNIROUTE_API_KEY`. Can reach **only** the OmniRoute gateway endpoint; no provider keys and no direct provider-endpoint access. |
 
 This keeps the agent sandbox free of all provider keys and prevents any credential from being used against the wrong endpoint.
 
@@ -300,7 +242,7 @@ The `omniroute-all-providers` profile enforces:
 
 ### 2. Agent sandbox — `omniroute-agent` provider
 
-This sandbox runs the agent (OpenCode, Claude Code, curl). It holds **only** `OMNIROUTE_API_KEY` and can reach **only** the OmniRoute gateway endpoint. No provider keys enter this sandbox, and the agent cannot call any provider endpoint directly:
+This sandbox runs the agent (Claude Code, curl). It holds **only** `OMNIROUTE_API_KEY` and can reach **only** the OmniRoute gateway endpoint. No provider keys enter this sandbox, and the agent cannot call any provider endpoint directly:
 
 ```bash
 openshell profile lint -f openshell/omniroute-agent.yaml
@@ -310,11 +252,12 @@ openshell provider create --name omniroute-agent --type omniroute-agent --from-e
 
 ```bash
 openshell sandbox create \
-  --name omniroute-agent \
-  --from ghcr.io/anomalyco/opencode:latest \
+  --name claude-agent \
+  --from <your-claude-code-image> \
   --provider omniroute-agent \
   --env OMNIROUTE_API_KEY="${OMNIROUTE_API_KEY}" \
-  --env OPENAI_BASE_URL=http://host.openshell.internal:20128/v1 \
+  --env ANTHROPIC_BASE_URL=http://host.openshell.internal:20128/v1 \
+  --env ANTHROPIC_AUTH_TOKEN="${OMNIROUTE_API_KEY}" \
   --detach \
   -- sh -c 'sleep 86400'
 ```
@@ -324,7 +267,7 @@ The `omniroute-agent` profile enforces:
 - **Sandbox agent sees only `OMNIROUTE_API_KEY`.** Upstream `{PROVIDER}_API_KEY` values never enter this sandbox.
 - **`path: /v1/**`** limits the agent to OmniRoute's OpenAI-compatible API; every other host (including all provider endpoints) is unreachable from the agent.
 - **`enforcement: enforce`** blocks any request outside the allowed endpoint.
-- **`binaries` allowlist** restricts agent binaries (`opencode`, `node`, `curl`) to the OmniRoute gateway endpoint.
+- **`binaries` allowlist** restricts agent binaries (`/home/claude/.local/bin/claude`, `node`, `curl`) to the OmniRoute gateway endpoint.
 
 Each provider is exclusive to its sandbox; never share a provider between the OmniRoute sandbox and the agent sandbox.
 
@@ -524,7 +467,7 @@ openshell sandbox delete omniroute-smoke omniroute-agent claude-code-agent
 | --- | --- |
 | `credential_endpoint_mismatch` | The profile's `endpoints` host, port, or path does not match the URL the agent calls. `host.openshell.internal` is not `localhost`; use the exact host declared in the profile. |
 | Connection refused or timeout to `host.openshell.internal:20128` | OmniRoute is not reachable from the sandbox. Confirm the port is published, the host address is correct for your gateway (host-local, Docker network, or LAN), and the profile declares that host. |
-| `403` or policy denial | Check `openshell policy get <sandbox> --full`; the provider must be attached and its `binaries` must include the calling executable (for example `/usr/local/bin/opencode` or `/usr/bin/curl`). |
+| `403` or policy denial | Check `openshell policy get <sandbox> --full`; the provider must be attached and its `binaries` must include the calling executable (for example `/home/claude/.local/bin/claude` or `/usr/bin/curl`). |
 | `401` from OmniRoute | The OmniRoute key is wrong, or `REQUIRE_API_KEY` is enabled without a valid key. Export the correct `OMNIROUTE_API_KEY` and recreate the provider with `--from-existing`. |
 | `429` or upstream provider errors | The selected provider failed or has no key. Check OmniRoute's logs and confirm the provider key is set in OmniRoute's system environment at startup (see [Provider credentials](#provider-credentials)). |
 
@@ -539,7 +482,7 @@ openshell sandbox delete omniroute-smoke omniroute-agent claude-code-agent
 - npm package: [https://www.npmjs.com/package/omniroute](https://www.npmjs.com/package/omniroute)
 - NVIDIA OpenShell: [https://docs.nvidia.com/openshell/](https://docs.nvidia.com/openshell/)
 - OpenShell provider profiles: [https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles)
-- OpenCode provider configuration: [https://opencode.ai/v2/docs/providers](https://opencode.ai/v2/docs/providers)
+- Claude Code: [https://claude.ai/code](https://claude.ai/code)
 - Claude Code: [https://claude.ai/code](https://claude.ai/code)
 
 ---
