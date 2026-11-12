@@ -1,0 +1,26 @@
+version: 1
+filesystem_policy:
+  # The uploaded project is the sandbox work directory.
+  include_workdir: true
+  read_only:
+    - /bin
+    - /usr
+    - /lib
+    - /lib64
+    - /opt
+    - /proc
+    - /sys
+    - /etc
+    - /var/log
+    - /dev/urandom
+    - /dev/random
+  read_write:
+    - /tmp
+    - /dev/null
+    - /dev/tty
+    # OpenShell's managed workspace volume.
+    - /sandbox
+    # Claude Code keeps settings, history, and session data here.
+    - /home/claude
+landlock:
+  compatibility: best_effort

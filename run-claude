@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+#
+# run-claude — run Claude Code in an NVIDIA OpenShell sandbox that reaches
+# OmniRoute through the omniroute-agent provider profile.
+#
+# The sandbox receives only an opaque OpenShell placeholder for
+# OMNIROUTE_API_KEY. At launch, the placeholder is copied into
+# ANTHROPIC_AUTH_TOKEN (the variable Claude Code reads). The real OmniRoute key
+# is resolved by the gateway only for approved requests; upstream provider keys
+# stay outside the sandbox.
+#
+# Usage:
+#   ./run-claude                       # interactive session
+#   ./run-claude "summarize this repo" # one-shot prompt
+#   ./run-claude --model auto "hello"  # extra args go to claude
+#
+# Common overrides:
+#   OMNIROUTE_API_KEY   OmniRoute key (falls back to .env in current dir or repo)
+#   OMNIROUTE_ORIGIN    Gateway origin, no /v1 suffix (auto-detected)
+#   CLAUDE_IMAGE        Docker/Podman image tag (default: claude-docker)
+#   CLAUDE_SANDBOX      Sandbox name (default: claude-code)
+#   CLAUDE_WORKSPACE    Host directory to upload (default: current directory)
+#   CLAUDE_WORKDIR      In-sandbox working directory (default: /sandbox/<basename>)
+#   ANTHROPIC_MODEL     Optional model id passed to Claude Code
+#   BUILD_IMAGE         auto (default), 1 (always), or 0 (never)
+#   UPLOAD              1 (default) to upload CLAUDE_WORKSPACE, 0 to skip
+#   KEEP_SANDBOX        1 to keep the sandbox after Claude Code exits
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$PWD"
+
+IMAGE="${CLAUDE_IMAGE:-claude-docker}"
+SANDBOX="${CLAUDE_SANDBOX:-claude-code}"
+PROFILE_NAME="${OMNIROUTE_PROFILE_NAME:-omniroute-agent}"
+PROVIDER_NAME="${OMNIROUTE_PROVIDER_NAME:-omniroute-agent}"
+PROFILE="$SCRIPT_DIR/openshell/omniroute-agent.yaml"
+POLICY="$SCRIPT_DIR/openshell/policy.yaml"
+PORT="${OMNIROUTE_PORT:-20128}"
+WORKSPACE="${CLAUDE_WORKSPACE:-$PROJECT_DIR}"
+BUILD_IMAGE="${BUILD_IMAGE:-auto}"
+UPLOAD="${UPLOAD:-1}"
+KEEP_SANDBOX="${KEEP_SANDBOX:-0}"
+
+log()  { printf '[run-claude] %s\n' "$*" >&2; }
+die()  { printf '[run-claude] ERROR: %s\n' "$*" >&2; exit 1; }
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+# ---------------------------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------------------------
+ENV_FILE="${OMNIROUTE_ENV_FILE:-}"
+if [[ -z "$ENV_FILE" ]]; then
+  if [[ -f "$PROJECT_DIR/.env" ]]; then
+    ENV_FILE="$PROJECT_DIR/.env"
+  else
+    ENV_FILE="$SCRIPT_DIR/.env"
+  fi
+fi
+
+if [[ -z "${OMNIROUTE_API_KEY:-}" && -f "$ENV_FILE" ]]; then
+  key="$(grep -E '^[[:space:]]*OMNIROUTE_API_KEY=' "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+  key="${key%$'\r'}"
+  key="${key%\"}"; key="${key#\"}"
+  key="${key%\'}"; key="${key#\'}"
+  OMNIROUTE_API_KEY="$key"
+fi
+
+[[ -n "${OMNIROUTE_API_KEY:-}" ]] || die \
+  "OMNIROUTE_API_KEY is not set. Export it or add it to .env (tried $PROJECT_DIR/.env and $SCRIPT_DIR/.env)."
+export OMNIROUTE_API_KEY
+
+[[ -f "$PROFILE" ]] || die "profile not found: $PROFILE"
+[[ -f "$POLICY" ]]  || die "policy not found: $POLICY"
+[[ -d "$WORKSPACE" ]] || die "workspace is not a directory: $WORKSPACE"
+require_cmd openshell
+
+# ---------------------------------------------------------------------------
+# Gateway driver and OmniRoute origin
+# ---------------------------------------------------------------------------
+GATEWAY_CONFIG="${OPENSHELL_GATEWAY_CONFIG:-$HOME/.config/openshell/gateway.toml}"
+DRIVER="${OPENSHELL_COMPUTE_DRIVER:-}"
+if [[ -z "$DRIVER" && -r "$GATEWAY_CONFIG" ]]; then
+  DRIVER="$(sed -n 's/^[[:space:]]*compute_driver[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$GATEWAY_CONFIG" | head -n1)"
+fi
+DRIVER="${DRIVER:-docker}"
+
+if command -v "$DRIVER" >/dev/null 2>&1; then
+  CONTAINER_CLI="$DRIVER"
+elif command -v docker >/dev/null 2>&1; then
+  CONTAINER_CLI="docker"
+elif command -v podman >/dev/null 2>&1; then
+  CONTAINER_CLI="podman"
+else
+  die "no container CLI found (looked for $DRIVER, docker, podman)"
+fi
+
+if [[ -z "${OMNIROUTE_ORIGIN:-}" ]]; then
+  case "$DRIVER" in
+    podman*) OMNIROUTE_ORIGIN="http://host.docker.internal:$PORT" ;;
+    *)       OMNIROUTE_ORIGIN="http://host.openshell.internal:$PORT" ;;
+  esac
+fi
+OMNIROUTE_ORIGIN="${OMNIROUTE_ORIGIN%/}"
+[[ "$OMNIROUTE_ORIGIN" != */v1 ]] || die \
+  "OMNIROUTE_ORIGIN must not include /v1; Claude Code appends /v1/messages itself."
+
+# ---------------------------------------------------------------------------
+# Image
+# ---------------------------------------------------------------------------
+image_exists() { "$CONTAINER_CLI" image inspect "$IMAGE" >/dev/null 2>&1; }
+
+if [[ "$BUILD_IMAGE" == "1" ]] || { [[ "$BUILD_IMAGE" == "auto" ]] && ! image_exists; }; then
+  log "Building image '$IMAGE' with $CONTAINER_CLI ..."
+  "$CONTAINER_CLI" build -t "$IMAGE" "$SCRIPT_DIR"
+elif ! image_exists; then
+  die "image '$IMAGE' not found (BUILD_IMAGE=$BUILD_IMAGE). Build it with: $CONTAINER_CLI build -t $IMAGE $SCRIPT_DIR"
+fi
+
+# ---------------------------------------------------------------------------
+# Sandbox cleanup and provider profile
+# ---------------------------------------------------------------------------
+SANDBOX_CREATED=0
+cleanup() {
+  local status=$?
+  if [[ "$SANDBOX_CREATED" == "1" ]]; then
+    if [[ "$KEEP_SANDBOX" == "1" ]]; then
+      log "Keeping sandbox '$SANDBOX'."
+    else
+      openshell sandbox delete "$SANDBOX" >/dev/null 2>&1 || true
+      log "Deleted sandbox '$SANDBOX'."
+    fi
+  fi
+  return "$status"
+}
+trap cleanup EXIT
+
+if openshell sandbox get "$SANDBOX" >/dev/null 2>&1; then
+  log "Deleting existing sandbox '$SANDBOX' ..."
+  openshell sandbox delete "$SANDBOX" >/dev/null
+fi
+
+# Recreate the profile and provider so a changed YAML or key is always picked
+# up. Keep these names dedicated to this launcher: deleting the provider
+# invalidates other sandboxes that use it.
+if openshell provider list 2>/dev/null | awk 'NR > 1 { print $1 }' | grep -qx "$PROVIDER_NAME"; then
+  log "Deleting existing provider '$PROVIDER_NAME' ..."
+  openshell provider delete "$PROVIDER_NAME" >/dev/null
+fi
+if openshell profile list 2>/dev/null | awk 'NR > 1 { print $1 }' | grep -qx "$PROFILE_NAME"; then
+  log "Deleting existing profile '$PROFILE_NAME' ..."
+  openshell profile delete "$PROFILE_NAME" >/dev/null
+fi
+
+log "Linting profile $PROFILE ..."
+openshell profile lint -f "$PROFILE" >/dev/null
+
+log "Importing profile '$PROFILE_NAME' ..."
+openshell profile import -f "$PROFILE" >/dev/null
+
+log "Creating provider '$PROVIDER_NAME' from OMNIROUTE_API_KEY ..."
+openshell provider create \
+  --name "$PROVIDER_NAME" \
+  --type "$PROFILE_NAME" \
+  --from-existing >/dev/null
+
+# ---------------------------------------------------------------------------
+# Create the sandbox
+# ---------------------------------------------------------------------------
+extra_env=()
+[[ -n "${ANTHROPIC_MODEL:-}" ]] && extra_env+=(--env "ANTHROPIC_MODEL=$ANTHROPIC_MODEL")
+
+log "Creating sandbox '$SANDBOX' from '$IMAGE' ..."
+SANDBOX_CREATED=1
+openshell sandbox create \
+  --name "$SANDBOX" \
+  --from "$IMAGE" \
+  --provider "$PROVIDER_NAME" \
+  --policy "$POLICY" \
+  --env "ANTHROPIC_BASE_URL=$OMNIROUTE_ORIGIN" \
+  --env "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1" \
+  "${extra_env[@]}" \
+  --detach \
+  -- sh -c 'sleep 86400'
+
+# ---------------------------------------------------------------------------
+# Workspace
+# ---------------------------------------------------------------------------
+if [[ "$UPLOAD" == "1" ]]; then
+  SANDBOX_WORKDIR="${CLAUDE_WORKDIR:-/sandbox/$(basename "$WORKSPACE")}"
+  log "Uploading '$WORKSPACE' to /sandbox ..."
+  openshell sandbox upload "$SANDBOX" "$WORKSPACE" /sandbox
+else
+  SANDBOX_WORKDIR="${CLAUDE_WORKDIR:-/sandbox}"
+fi
+
+# ---------------------------------------------------------------------------
+# Run Claude Code
+# ---------------------------------------------------------------------------
+log "Running Claude Code via OmniRoute at $OMNIROUTE_ORIGIN ..."
+status=0
+# ANTHROPIC_AUTH_TOKEN is the variable Claude Code reads. OpenShell only
+# exposes the OMNIROUTE_API_KEY placeholder inside the sandbox, so copy it
+# before launching; the real key never enters the sandbox.
+openshell sandbox exec \
+  -n "$SANDBOX" \
+  --workdir "$SANDBOX_WORKDIR" \
+  --no-login-shell \
+  -- sh -c 'ANTHROPIC_AUTH_TOKEN="$OMNIROUTE_API_KEY" exec /home/claude/.local/bin/claude "$@"' sh "$@" || status=$?
+
+exit "$status"

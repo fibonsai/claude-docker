@@ -1,87 +1,76 @@
 # claude-docker
 
-A minimal Alpine-based Docker image that runs **[Claude Code](https://claude.ai/code)** (the official Anthropic CLI) inside a container.
+A minimal Alpine image that runs **[Claude Code](https://claude.ai/code)** (the official Anthropic CLI) as the unprivileged `claude` user.
 
-Built on [`fibonsai/omniroute-docker`](https://github.com/fibonsai/omniroute-docker) patterns, this image is designed to run Claude Code through **[OmniRoute](https://github.com/diegosouzapw/OmniRoute)** — a unified AI gateway exposing hundreds of providers behind a single OpenAI-compatible endpoint — with **NVIDIA OpenShell** as the sandboxed execution environment.
-
-> OmniRoute (referred to as "omnirouter" throughout this README) is the OpenAI-compatible gateway that sits between your sandboxed agent and the upstream model providers. It is maintained upstream by Diego Souza and packaged in `fibonsai/omniroute-docker`.
+It also ships the pieces needed to run Claude Code in an **[NVIDIA OpenShell](https://docs.nvidia.com/openshell/)** sandbox through **[OmniRoute](https://github.com/cheaper-inference/OmniRoute)**: an agent provider profile, a filesystem policy, and the `run-claude` launcher.
 
 ---
 
-## What this image does
+## Repository layout
 
-- Installs Claude Code CLI (`~claude/.local/bin/claude`) on Alpine
-- Runs as the unprivileged `claude` user
-- Works standalone (`claude` directly) or routed through OmniRoute via OpenShell sandboxes
-
-The Dockerfile in this repo:
-
-```dockerfile
-FROM alpine:latest
-
-RUN adduser claude || true
-RUN echo "https://dl-cdn.alpinelinux.org/alpine/v3.22/community" >> /etc/apk/repositories && apk update
-RUN apk add --no-cache ca-certificates curl libc6-compat tzdata bash libgcc libstdc++ ripgrep
-
-USER claude
-RUN curl -fsSL https://claude.ai/install.sh | bash 
-ENV PATH=${PATH}:~claude/.local/bin
-
-WORKDIR /workspace
-```
+| Path | Purpose |
+| --- | --- |
+| `Dockerfile` | Builds the Claude Code image. |
+| `openshell/omniroute-agent.yaml` | OpenShell provider profile for the Claude Code sandbox. Exposes only OmniRoute's API. |
+| `openshell/policy.yaml` | Filesystem policy for the Claude Code sandbox. |
+| `run-claude` | Creates a sandbox, uploads a workspace, runs Claude Code, and cleans up. |
 
 ---
 
-## Quick start (standalone)
+## Quick start: standalone
 
-Build and run Claude Code directly, without OmniRoute:
+Build the image and run Claude Code directly against Anthropic:
 
 ```bash
-# 1. Build the image
 docker build -t claude-docker .
 
-# 2. Run Claude Code
 docker run -it --rm \
   --name claude-code \
   -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}" \
   -v "$PWD:/workspace" \
   -w /workspace \
   claude-docker \
-  claude
+  /home/claude/.local/bin/claude
 ```
 
-Claude Code authenticates directly to Anthropic with `ANTHROPIC_API_KEY`.
+The image installs the CLI under `/home/claude/.local/bin` and adds it to `PATH`.
 
 ---
 
-## Running through OmniRoute + NVIDIA OpenShell (recommended)
+## Quick start: OpenShell + OmniRoute (recommended)
 
-The secure, multi-provider architecture routes every sandboxed agent through **OmniRoute**, which holds the real upstream provider keys (`NVIDIA_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, etc.) in its own system environment. The sandbox agent sees **only** an OmniRoute API key (`OMNIROUTE_API_KEY`) and can reach **only** OmniRoute's OpenAI-compatible endpoint — never the upstream providers directly.
+Claude Code talks the Anthropic Messages API. OmniRoute exposes an Anthropic/OpenAI-compatible gateway, so Claude Code points at OmniRoute with `ANTHROPIC_BASE_URL` and authenticates with an OmniRoute key.
 
 ```
-Claude Code / curl (sandbox)
-        │  OMNIROUTE_API_KEY (opaque placeholder)
+Claude Code (OpenShell sandbox)
+        │  ANTHROPIC_AUTH_TOKEN = OMNIROUTE_API_KEY placeholder
         ▼
-OmniRoute :20128/v1   (OpenAI-compatible gateway)
-        │  real provider keys (stay outside the sandbox)
+OmniRoute :20128   (Anthropic + OpenAI-compatible gateway)
+        │  real upstream keys (never enter the sandbox)
         ▼
 NVIDIA NIM, OpenAI, Anthropic, Gemini, OpenRouter, ...
 ```
 
-This repo follows the provider profile patterns from [`fibonsai/omniroute-docker`](https://github.com/fibonsai/omniroute-docker/tree/main/openshell).
+The sandbox sees only an opaque placeholder managed by OpenShell. Upstream `{PROVIDER}_API_KEY` values stay in OmniRoute's own environment.
 
 ### Prerequisites
 
-- Docker (or Podman)
-- [NVIDIA OpenShell](https://docs.nvidia.com/openshell/) installed (`openshell` CLI)
-- An OmniRoute image built from `fibonsai/omniroute-docker`
-- Provider API keys declared in OmniRoute's environment at startup
+- Docker or Podman, with the matching OpenShell gateway configured
+- The `openshell` CLI
+- An OmniRoute instance reachable from the sandbox
+- An OmniRoute API key
 
-### Step 1 — Start OmniRoute
+### 1. Start OmniRoute
 
-Publish the API port so sandboxes can reach it, and require an OmniRoute API key:
+Use the companion image from [`fibonsai/omniroute-docker`](https://github.com/fibonsai/omniroute-docker), or run OmniRoute inside OpenShell with that repository's `run-omniroute.sh`.
+
+Standalone Docker example:
 
 ```bash
+git clone https://github.com/fibonsai/omniroute-docker.git
+cd omniroute-docker
+docker build -t omniroute-docker .
+
 docker run -d \
   --name omniroute \
   --restart unless-stopped \
@@ -90,138 +79,175 @@ docker run -d \
   -e REQUIRE_API_KEY='true' \
   -e NVIDIA_API_KEY="${NVIDIA_API_KEY}" \
   -e OPENROUTER_API_KEY="${OPENROUTER_API_KEY}" \
-  -e GEMINI_API_KEY="${GEMINI_API_KEY}" \
   -v omniroute-data:/home/node/.omniroute \
-  fibonsai/omniroute-docker
+  omniroute-docker omniroute --no-open
 ```
 
-Open [http://localhost:20128](http://localhost:20128), log in with `INITIAL_PASSWORD`, and create an API key under **Endpoints**. Export it for OpenShell:
+Open <http://localhost:20128>, log in with `INITIAL_PASSWORD`, create an API key under **Endpoints**, and export it:
 
 ```bash
-export OMNIROUTE_API_KEY='omni-...'
+export OMNIROUTE_API_KEY='sk-...'
 ```
 
-Destination provider keys must be present in OmniRoute's system environment **before** the container starts (they are read at startup, not added afterward through the dashboard).
+Upstream provider keys must be present in OmniRoute's environment **before** it starts. Do not store them in the sandbox or bake them into an image.
 
-### Step 2 — Create the OpenShell provider profile
+### 2. Run Claude Code
 
-Use the profile below. The endpoint host must be the address the sandbox uses to reach OmniRoute. `host.openshell.internal` is the documented host gateway for a service running on the OpenShell host; if OmniRoute runs elsewhere (or on another container network), replace `host.openshell.internal` with that reachable hostname or IP.
-
-Save as `openshell/omniroute.yaml`:
-
-```yaml
-id: omniroute
-display_name: OmniRoute
-description: Self-hosted OmniRoute OpenAI-compatible gateway with system-env provider keys
-category: inference
-inference_capable: true
-
-credentials:
-  - name: api_key
-    description: OmniRoute API key (sandbox-facing, opaque placeholder)
-    env_vars: [OMNIROUTE_API_KEY]
-    required: true
-    auth_style: bearer
-    header_name: authorization
-
-discovery:
-  credentials: [api_key]
-
-endpoints:
-  - host: host.openshell.internal
-    port: 20128
-    path: /v1/**
-    protocol: rest
-    access: read-write
-    enforcement: enforce
-
-binaries:
-  - /home/claude/.local/bin/claude
-  - /usr/local/bin/node
-  - /usr/bin/curl
-  - /usr/local/bin/curl
-```
-
-The profile enforces strict credential-to-endpoint binding:
-
-- **Sandbox sees only `OMNIROUTE_API_KEY`.** Upstream `{PROVIDER}_API_KEY` values never enter the sandbox.
-- **`path: /v1/**`** limits the sandbox to OmniRoute's OpenAI-compatible API; the dashboard and every other host are unreachable.
-- **`enforcement: enforce`** blocks any request outside the allowed endpoint.
-- **`binaries` allowlist** restricts which processes may use the endpoint to `claude` (at `/home/claude/.local/bin/claude`), `node`, and `curl`.
-
-Lint, import, and create the provider:
+From this repository:
 
 ```bash
-openshell profile lint -f openshell/omniroute.yaml
-openshell profile import -f openshell/omniroute.yaml
-openshell provider create --name omniroute --type omniroute --from-existing
+export OMNIROUTE_API_KEY='sk-...'
+./run-claude
 ```
 
-`--from-existing` reads `OMNIROUTE_API_KEY` from your shell and stores it in OpenShell; the sandbox receives only an opaque placeholder.
-
-### Step 3 — Run Claude Code through OmniRoute
-
-This project's Dockerfile installs the Claude Code CLI at `/home/claude/.local/bin/claude`. Build your own image from this repo and reference it as `<your-claude-code-image>`. Run it inside an `omniroute` sandbox so it reaches OmniRoute — and therefore every connected provider — without holding any upstream `{PROVIDER}_API_KEY`:
+One-shot prompt:
 
 ```bash
-openshell sandbox create \
-  --name claude-code-agent \
-  --from <your-claude-code-image> \
-  --provider omniroute \
-  --env ANTHROPIC_BASE_URL=http://host.openshell.internal:20128/v1 \
-  --env ANTHROPIC_AUTH_TOKEN="${OMNIROUTE_API_KEY}" \
-  --detach \
-  -- sh -c 'sleep 86400'
-
-openshell sandbox exec -n claude-code-agent --workdir /workspace -- \
-  /home/claude/.local/bin/claude "Summarize the files in this workspace."
+./run-claude "Summarize the files in this workspace."
 ```
 
-Claude Code authenticates to OmniRoute with `OMNIROUTE_API_KEY`, and OmniRoute routes to the configured provider (e.g. NVIDIA NIM, OpenAI, Gemini). The Claude Code sandbox never sees `NVIDIA_API_KEY`, `GEMINI_API_KEY`, or any other upstream key.
+`run-claude` does the following:
 
-Claude Code uses `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` to point at any OpenAI-compatible endpoint, so OmniRoute's `/v1/chat/completions` works as a drop-in replacement for the Anthropic API.
+1. Loads `OMNIROUTE_API_KEY` from the environment, or from `.env` in the current directory (falling back to `.env` in this repository).
+2. Builds `claude-docker` if the image is missing.
+3. Recreates `openshell/omniroute-agent.yaml` and the `omniroute-agent` provider from `OMNIROUTE_API_KEY`.
+4. Creates an OpenShell sandbox with `openshell/policy.yaml`, the provider, and `ANTHROPIC_BASE_URL` pointing at OmniRoute.
+5. Uploads the current directory to `/sandbox` (Git-aware; `.gitignore` rules apply).
+6. Runs `/home/claude/.local/bin/claude` and deletes the sandbox when it exits.
 
-## Credential security
+`run-claude` copies OpenShell's opaque `OMNIROUTE_API_KEY` placeholder into `ANTHROPIC_AUTH_TOKEN` inside the sandbox, so Claude Code authenticates to OmniRoute without the real key ever entering the sandbox.
 
-The sandbox agent never holds upstream provider keys. It only sees `OMNIROUTE_API_KEY` (an opaque placeholder managed by OpenShell) and reaches OmniRoute at `host.openshell.internal:20128/v1`. Upstream provider keys come through OmniRoute's system environment at startup (`NVIDIA_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`/`GOOGLE_API_KEY`, `DEEPSEEK_API_KEY`, `JINA_AI_API_KEY`/`JINA_API_KEY`) and are never stored in OmniRoute's database for this flow. Even if the sandbox is compromised, the attacker cannot extract upstream API keys.
+The profile and provider are recreated on every run so a changed YAML or key is always applied. Keep the `omniroute-agent` names dedicated to this launcher; deleting the provider invalidates other sandboxes that use it.
 
-> **Why not add every upstream provider to OpenShell?** The sandbox does not call the upstream APIs; it calls OmniRoute. Adding `api.openai.com`, `api.anthropic.com`, and the rest to the sandbox policy would expose their credentials to the agent and bypass OmniRoute's routing, retries, and accounting. Keep one OpenShell provider for OmniRoute and declare upstream keys through OmniRoute's system environment at startup.
+Pass extra flags through to Claude Code:
+
+```bash
+./run-claude --model auto "Explain the Dockerfile."
+```
+
+#### Configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `OMNIROUTE_API_KEY` | environment or `.env` | OmniRoute API key. Required. |
+| `OMNIROUTE_ORIGIN` | auto-detected | Gateway origin **without** `/v1`, e.g. `http://host.docker.internal:20128`. |
+| `OMNIROUTE_PORT` | `20128` | Port used when auto-detecting the origin. |
+| `CLAUDE_IMAGE` | `claude-docker` | Container image to run. |
+| `CLAUDE_SANDBOX` | `claude-code` | Sandbox name. An existing sandbox with this name is replaced. |
+| `CLAUDE_WORKSPACE` | current directory | Host directory uploaded to the sandbox. |
+| `CLAUDE_WORKDIR` | `/sandbox/<basename>` | Working directory used inside the sandbox. |
+| `ANTHROPIC_MODEL` | unset | Optional model id passed to Claude Code. |
+| `BUILD_IMAGE` | `auto` | `auto` (build only when missing), `1` (always), `0` (never). |
+| `UPLOAD` | `1` | Set to `0` to skip uploading `CLAUDE_WORKSPACE`. |
+| `KEEP_SANDBOX` | `0` | Set to `1` to keep the sandbox after Claude Code exits. |
+| `OMNIROUTE_ENV_FILE` | `./.env`, then repo `.env` | File used to read `OMNIROUTE_API_KEY`. |
+
+#### Gateway address
+
+Claude Code must use the gateway origin, **not** `/v1`; it appends `/v1/messages` itself.
+
+| Sandbox location | OmniRoute origin |
+| --- | --- |
+| Docker-backed gateway | `http://host.openshell.internal:20128` |
+| Podman-backed gateway | `http://host.docker.internal:20128` |
+| Outside OpenShell | the service URL from `openshell service list` |
+
+`run-claude` reads `compute_driver` from `~/.config/openshell/gateway.toml` and picks the matching host alias. Override it with `OMNIROUTE_ORIGIN` if OmniRoute runs elsewhere:
+
+```bash
+export OMNIROUTE_ORIGIN='http://192.168.0.15:20128'
+```
+
+### 3. Inspect or clean up
+
+When `KEEP_SANDBOX=1` is set:
+
+```bash
+openshell sandbox exec -n claude-code --workdir /sandbox -- ls -la
+openshell sandbox delete claude-code
+```
+
+To inspect the effective policy and provider binding:
+
+```bash
+openshell policy get claude-code --full
+openshell sandbox get claude-code
+```
+
+---
+
+## What the OpenShell profile enforces
+
+`openshell/omniroute-agent.yaml`:
+
+- **One credential, one placeholder.** The sandbox receives only `OMNIROUTE_API_KEY`, an opaque placeholder. `run-claude` copies it into `ANTHROPIC_AUTH_TOKEN` when it launches Claude Code.
+- **One reachable endpoint.** Only `/v1/**` on OmniRoute's port is allowed. The dashboard and upstream provider endpoints are blocked.
+- **Both host aliases.** `host.openshell.internal` (Docker) and `host.docker.internal` (Podman) are declared so the profile works on either gateway.
+- **Binary allowlist.** Only `claude`, `node`, and `curl` may call the endpoint.
+
+`openshell/policy.yaml`:
+
+- The OpenShell-managed `/sandbox` workspace is writable.
+- System paths (`/bin`, `/usr`, `/lib`, `/etc`, `/opt`, …) are read-only.
+- `/tmp`, `/dev/null`, `/dev/tty`, and `/home/claude` are writable so Claude Code can keep its settings and session files.
+
+---
+
+## Security model
+
+- **Upstream keys never enter the agent sandbox.** OmniRoute holds them in its own environment and routes each request.
+- **OpenShell resolves placeholders at the endpoint.** The sandbox cannot read the real OmniRoute key; it only sees a placeholder that the gateway swaps when a request targets the declared endpoint.
+- **Claude Code receives the placeholder, not the key.** `run-claude` exports the placeholder as `ANTHROPIC_AUTH_TOKEN` at process launch; OpenShell substitutes the real credential only inside the approved OmniRoute request.
+- **No direct provider access.** The agent profile allows only OmniRoute's `/v1/**`; `api.openai.com`, `api.anthropic.com`, and similar hosts are unreachable.
+- **The sandbox is unprivileged.** The image runs Claude Code as `claude`, not root.
+- **The sandbox is ephemeral by default.** `run-claude` deletes it on exit and uploads the workspace from the host each run.
+
+Do not add upstream provider keys to the agent sandbox, and do not widen the profile to the OmniRoute dashboard or provider hosts.
 
 ---
 
 ## Persistence
 
-Mount a volume at OmniRoute's data directory (`/home/node/.omniroute`). That directory holds `storage.sqlite`, the generated secrets in `.env`, database backups, and installed plugins. Without a volume, all configuration is lost when the container is removed.
+OmniRoute data lives in `/home/node/.omniroute` (`storage.sqlite`, generated secrets, backups, plugins). Mount a volume there or all configuration is lost when the container is removed:
 
-For Claude Code's own data (conversation history, config), mount a volume or bind-mount into `/workspace` or `~claude/.config` depending on your image setup.
+```bash
+-v omniroute-data:/home/node/.omniroute
+```
+
+The Claude Code sandbox is disposable in this workflow. Keep the workspace in Git (or on the host) and let `run-claude` upload it on each run. If you need to preserve files written inside the sandbox, set `KEEP_SANDBOX=1` and download them before deleting the sandbox.
 
 ---
 
-## OpenShell troubleshooting
+## Troubleshooting
 
 | Symptom | Fix |
 | --- | --- |
-| `credential_endpoint_mismatch` | The profile's `endpoints` host, port, or path does not match the URL the agent calls. `host.openshell.internal` is not `localhost`; use the exact host declared in the profile. |
-| Connection refused or timeout to `host.openshell.internal:20128` | OmniRoute is not reachable from the sandbox. Confirm the port is published, the host address is correct for your gateway (host-local, Docker network, or LAN), and the profile declares that host. |
-| `403` or policy denial | Check `openshell policy get <sandbox> --full`; the provider must be attached and its `binaries` must include the calling executable (for example `/home/claude/.local/bin/claude` or `/usr/bin/curl`). |
-| `401` from OmniRoute | The OmniRoute key is wrong, or `REQUIRE_API_KEY` is enabled without a valid key. Export the correct `OMNIROUTE_API_KEY` and recreate the provider with `--from-existing`. |
-| `429` or upstream provider errors | The selected provider failed or has no key. Check OmniRoute's logs and confirm the provider key is set in OmniRoute's system environment at startup (see [Provider credentials](#provider-credentials)). |
+| `OMNIROUTE_API_KEY is not set` | Export the key or write `OMNIROUTE_API_KEY=...` to `.env`. |
+| `image 'claude-docker' not found` | Run `docker build -t claude-docker .`, or set `CLAUDE_IMAGE` to your tag. |
+| `profile not found` / profile errors | Run `openshell profile lint -f openshell/omniroute-agent.yaml`, then re-run `run-claude`. |
+| `WorkspaceValidationFailed: OCI WorkingDir is not usable` | The image's `WORKDIR` must be `/sandbox` for OpenShell's managed workspace volume. Rebuild with this repository's Dockerfile, or set `CLAUDE_IMAGE` to an image that uses `/sandbox`. |
+| Claude Code ignores the gateway | `ANTHROPIC_BASE_URL` must be the origin **without** `/v1`. Restart the sandbox after changing it; Claude Code reads the variable at startup. |
+| `401` from OmniRoute | The key is wrong or revoked. Re-export `OMNIROUTE_API_KEY`; `run-claude` recreates the provider on every run. |
+| `403` or a policy denial | The request must target `/v1/**` on the declared host, and the calling binary must be in the profile's `binaries` allowlist. Check with `openshell policy get claude-code --full`. |
+| `credential_endpoint_mismatch` | The profile host, port, or path does not match the URL Claude Code calls. Use `host.openshell.internal` on Docker, `host.docker.internal` on Podman, or set `OMNIROUTE_ORIGIN` to the exact reachable origin. |
+| Connection refused or timeout | OmniRoute is not reachable from the sandbox. Confirm port `20128` is published and that the origin matches your gateway's host alias. On Podman, `host.openshell.internal` does not exist; use `host.docker.internal`. |
+| `/model` picker is empty | Set `ANTHROPIC_MODEL` to an exposed model id, or enable discovery with `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` (already set by `run-claude`). |
+| Upload is slow or too large | Set `UPLOAD=0` and work with a pre-populated image, or point `CLAUDE_WORKSPACE` at a smaller directory. |
 
 ---
 
 ## Links
 
-- This image's Dockerfile: [`Dockerfile`](./Dockerfile)
-- OmniRoute Docker image: [https://github.com/fibonsai/omniroute-docker](https://github.com/fibonsai/omniroute-docker)
-- Upstream OmniRoute project: [https://github.com/diegosouzapw/OmniRoute](https://github.com/diegosouzapw/OmniRoute)
-- OmniRoute website and docs: [https://omniroute.online](https://omniroute.online)
-- npm package: [https://www.npmjs.com/package/omniroute](https://www.npmjs.com/package/omniroute)
-- NVIDIA OpenShell: [https://docs.nvidia.com/openshell/](https://docs.nvidia.com/openshell/)
-- OpenShell provider profiles: [https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles](https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles)
-- Claude Code: [https://claude.ai/code](https://claude.ai/code)
+- Claude Code: <https://claude.ai/code>
+- OmniRoute Docker packaging: <https://github.com/fibonsai/omniroute-docker>
+- OmniRoute upstream: <https://github.com/cheaper-inference/OmniRoute>
+- OmniRoute website and docs: <https://omniroute.online>
+- OmniRoute on npm: <https://www.npmjs.com/package/omniroute>
+- NVIDIA OpenShell: <https://docs.nvidia.com/openshell/>
+- OpenShell provider profiles: <https://docs.nvidia.com/openshell/latest/how-it-works/providers/profiles>
 
 ---
 
 ## License
 
-The packaging files in this repository are provided as-is. OmniRoute is distributed under the MIT License; see the [upstream license](https://github.com/diegosouzapw/OmniRoute/blob/main/LICENSE).
+The packaging files in this repository are provided as-is. OmniRoute is distributed under the MIT License; see the [upstream license](https://github.com/cheaper-inference/OmniRoute/blob/main/LICENSE).

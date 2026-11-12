@@ -1,0 +1,53 @@
+id: omniroute-agent
+display_name: OmniRoute Agent (Claude Code)
+description: >-
+  Claude Code sandbox that reaches ONLY the OmniRoute gateway through
+  OMNIROUTE_API_KEY / ANTHROPIC_AUTH_TOKEN. Upstream provider keys never enter
+  this sandbox.
+category: inference
+inference_capable: true
+
+# The sandbox receives an opaque placeholder, resolved by OpenShell only for
+# requests to the OmniRoute endpoint below. run-claude copies this placeholder
+# into ANTHROPIC_AUTH_TOKEN at launch, which is what Claude Code reads.
+credentials:
+  - name: api_key
+    description: OmniRoute API key (sandbox-facing, opaque placeholder)
+    env_vars:
+      - OMNIROUTE_API_KEY
+    required: true
+    auth_style: bearer
+    header_name: authorization
+    query_param: ""
+
+discovery:
+  credentials: [api_key]
+
+# Only OmniRoute's Anthropic/OpenAI-compatible API is reachable. The dashboard
+# and every upstream provider endpoint stay blocked. Both host aliases are
+# declared so the same profile works on Docker- and Podman-backed gateways.
+endpoints:
+  - host: host.openshell.internal
+    port: 20128
+    path: /v1/**
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+    credentials: [api_key]
+  - host: host.docker.internal
+    port: 20128
+    path: /v1/**
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+    credentials: [api_key]
+
+# Only these processes may call the OmniRoute endpoint.
+binaries:
+  - /home/claude/.local/bin/claude
+  - /usr/local/bin/claude
+  - /usr/local/bin/node
+  - /usr/bin/node
+  - /bin/node
+  - /usr/bin/curl
+  - /usr/local/bin/curl
