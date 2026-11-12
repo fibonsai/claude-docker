@@ -69,7 +69,7 @@ Standalone Docker example:
 ```bash
 git clone https://github.com/fibonsai/omniroute-docker.git
 cd omniroute-docker
-docker build -t omniroute-docker .
+docker build -t fibonsai/omniroute .
 
 docker run -d \
   --name omniroute \
@@ -80,7 +80,7 @@ docker run -d \
   -e NVIDIA_API_KEY="${NVIDIA_API_KEY}" \
   -e OPENROUTER_API_KEY="${OPENROUTER_API_KEY}" \
   -v omniroute-data:/home/node/.omniroute \
-  omniroute-docker omniroute --no-open
+  fibonsai/omniroute omniroute --no-open
 ```
 
 Open <http://localhost:20128>, log in with `INITIAL_PASSWORD`, create an API key under **Endpoints**, and export it:
@@ -207,12 +207,6 @@ Do not add upstream provider keys to the agent sandbox, and do not widen the pro
 ---
 
 ## Persistence
-
-OmniRoute data lives in `/home/node/.omniroute` (`storage.sqlite`, generated secrets, backups, plugins). Mount a volume there or all configuration is lost when the container is removed:
-
-```bash
--v omniroute-data:/home/node/.omniroute
-```
 
 The Claude Code sandbox is disposable in this workflow. Keep the workspace in Git (or on the host) and let `run-claude` upload it on each run. If you need to preserve files written inside the sandbox, set `KEEP_SANDBOX=1` and download them before deleting the sandbox.
 
