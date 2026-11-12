@@ -11,7 +11,7 @@ It also ships the pieces needed to run Claude Code in an **[NVIDIA OpenShell](ht
 | Path | Purpose |
 | --- | --- |
 | `Dockerfile` | Builds the Claude Code image. |
-| `openshell/omniroute-agent.yaml` | OpenShell provider profile for the Claude Code sandbox. Exposes only OmniRoute's API. |
+| `openshell/omniroute.yaml` | OpenShell provider profile for the Claude Code sandbox. Exposes only OmniRoute's API. |
 | `openshell/policy.yaml` | Filesystem policy for the Claude Code sandbox. |
 | `run-claude` | Creates a sandbox, uploads a workspace, runs Claude Code, and cleans up. |
 
@@ -110,7 +110,7 @@ One-shot prompt:
 
 1. Loads `OMNIROUTE_API_KEY` from the environment, or from `.env` in the current directory (falling back to `.env` in this repository).
 2. Builds `claude-docker` if the image is missing.
-3. Recreates `openshell/omniroute-agent.yaml` and the `omniroute-agent` provider from `OMNIROUTE_API_KEY`.
+3. Recreates `openshell/omniroute.yaml` and the `omniroute-agent` provider from `OMNIROUTE_API_KEY`.
 4. Creates an OpenShell sandbox with `openshell/policy.yaml`, the provider, and `ANTHROPIC_BASE_URL` pointing at OmniRoute.
 5. Uploads the current directory to `/sandbox` (Git-aware; `.gitignore` rules apply).
 6. Runs `/home/claude/.local/bin/claude` and deletes the sandbox when it exits.
@@ -178,7 +178,7 @@ openshell sandbox get claude-code
 
 ## What the OpenShell profile enforces
 
-`openshell/omniroute-agent.yaml`:
+`openshell/omniroute.yaml`:
 
 - **One credential, one placeholder.** The sandbox receives only `OMNIROUTE_API_KEY`, an opaque placeholder. `run-claude` copies it into `ANTHROPIC_AUTH_TOKEN` when it launches Claude Code.
 - **One reachable endpoint.** Only `/v1/**` on OmniRoute's port is allowed. The dashboard and upstream provider endpoints are blocked.
@@ -218,7 +218,7 @@ The Claude Code sandbox is disposable in this workflow. Keep the workspace in Gi
 | --- | --- |
 | `OMNIROUTE_API_KEY is not set` | Export the key or write `OMNIROUTE_API_KEY=...` to `.env`. |
 | `image 'claude-docker' not found` | Run `docker build -t claude-docker .`, or set `CLAUDE_IMAGE` to your tag. |
-| `profile not found` / profile errors | Run `openshell profile lint -f openshell/omniroute-agent.yaml`, then re-run `run-claude`. |
+| `profile not found` / profile errors | Run `openshell profile lint -f openshell/omniroute.yaml`, then re-run `run-claude`. |
 | `WorkspaceValidationFailed: OCI WorkingDir is not usable` | The image's `WORKDIR` must be `/sandbox` for OpenShell's managed workspace volume. Rebuild with this repository's Dockerfile, or set `CLAUDE_IMAGE` to an image that uses `/sandbox`. |
 | Claude Code ignores the gateway | `ANTHROPIC_BASE_URL` must be the origin **without** `/v1`. Restart the sandbox after changing it; Claude Code reads the variable at startup. |
 | `401` from OmniRoute | The key is wrong or revoked. Re-export `OMNIROUTE_API_KEY`; `run-claude` recreates the provider on every run. |
